@@ -112,85 +112,116 @@ class FacturaCliente(http.Controller):
 
     @http.route('/portal/facturacliente/results/', type="http", auth="public", csrf=False, website=True)
     def my_fact_portal_insert(self, **kwargs):
-        ### Esta linea implementa los Captcha en el Portal ####
-        # if kwargs.has_key('g-recaptcha-response') and request.website.is_captcha_valid(kwargs['g-recaptcha-response']):
         partner = request.env.user.partner_id
         rfc_partner = kwargs.get('rfc_partner') or (partner.vat and partner.vat.replace('MX', '')) or False
         order_number = kwargs.get('order_number') or False
         mail_to = kwargs.get('mail_to', False)
         ticket_pos = kwargs.get('ticket_pos', False)
-        monto_total = kwargs.get('monto_total', 0)
+        monto_total = kwargs.get('monto_total', '0')
         forma_de_pago_cfdi = kwargs.get('forma_de_pago_cfdi', False)
-
         partner_name = kwargs.get('partner_name', False)
         correo_electronico = kwargs.get('correo_electronico', False)
         cp_post = kwargs.get('cp_post', False)
         regimen_fiscal = kwargs.get('regimen_fiscal', False)
         uso_del_cfdi = kwargs.get('uso_del_cfdi', False)
+        
+        # VALIDACIÓN TEMPRANA - ANTES DE PROCESAR
+        errores = []
+        if not rfc_partner:
+            errores.append('El RFC es obligatorio.')
+        if not order_number:
+            errores.append('El Folio de Venta es obligatorio.')
+        if not monto_total or monto_total == '0':
+            errores.append('El Monto Total es obligatorio.')
+        if not correo_electronico:
+            errores.append('El Correo electrónico es obligatorio.')
+        if not partner_name:
+            errores.append('El Nombre es obligatorio.')
+        if not regimen_fiscal:
+            errores.append('El Régimen Fiscal es obligatorio.')
+        if not uso_del_cfdi:
+            errores.append('El Uso del CFDI es obligatorio.')
+        if not forma_de_pago_cfdi:
+            errores.append('La Forma de Pago es obligatoria.')
+        
+        # Si hay errores, retornar inmediatamente
+        if errores:
+            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', {'errores': errores})
+        
+        # Validar y convertir monto_total de forma segura
+        try:
+            monto_total_clean = monto_total.replace(',', '').strip()
+            monto_total_float = float(monto_total_clean)
+            if monto_total_float <= 0:
+                return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', 
+                                        {'errores': ['El monto total debe ser mayor a 0.']})
+        except (ValueError, AttributeError):
+            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', 
+                                    {'errores': ['El monto total no es válido. Use solo números (ej: 1234.56)']})
+        
         if 'ticket_pos' in kwargs:
             ticket_pos = kwargs.get('ticket_pos') or True
         else:
             ticket_pos = False
+        
         auto_invoice_obj = http.request.env['website.self.invoice.web'].sudo()
-        partner_obj = http.request.env['res.partner']
-        partner_obj = partner_obj.sudo()
+        partner_obj = http.request.env['res.partner'].sudo()
         partner_exist = partner_obj.search([('vat', '=', rfc_partner.upper())], limit=1)
         partner_vals = {}
-        #if partner_name:
-        #    partner_vals.update({'name': partner_name})
-        if rfc_partner and correo_electronico and monto_total and order_number:
-            if partner_exist:
-                if partner_exist.email != correo_electronico:
-                    if partner_exist.email:
-                        partner_vals.update({'email' : partner_exist.email + '; ' + correo_electronico})
-                    else:
-                        partner_vals.update({'email' : correo_electronico})
-                partner_vals.update({'name' : partner_name})
-                partner_vals.update({'l10n_mx_edi_fiscal_regime': regimen_fiscal })
-                partner_vals.update({'zip' : cp_post})
-                partner_exist.write(partner_vals)
-            else:
-                if partner_name:
-                    partner_vals.update({'name' : partner_name})
-                    partner_vals.update({"vat" : rfc_partner.upper()})
-                    partner_vals.update({'email' : correo_electronico})
-                    partner_vals.update({'l10n_mx_edi_fiscal_regime' : regimen_fiscal })
-                    partner_vals.update({'zip' : cp_post})
-                    partner_vals.update({'country_id' : http.request.env['res.country'].search([('code','=','MX')],limit=1).id})
-                    partner_exist = partner_obj.create(partner_vals)
+        
+        if partner_exist:
+            if partner_exist.email != correo_electronico:
+                if partner_exist.email:
+                    partner_vals.update({'email': partner_exist.email + '; ' + correo_electronico})
                 else:
-                    return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', {'errores':['Es un usuario nuevo por lo que tiene que ingresar el nombre.']})
+                    partner_vals.update({'email': correo_electronico})
+            partner_vals.update({'name': partner_name})
+            partner_vals.update({'l10n_mx_edi_fiscal_regime': regimen_fiscal})
+            partner_vals.update({'zip': cp_post})
+            partner_exist.write(partner_vals)
         else:
-            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', {'errores':['Es necesario llenar los campos obligatorios.']})
-
-        #### Si tenemos datos de una consulta previa los retornamos
-        request_preview = auto_invoice_obj.search([('rfc_partner', '=', rfc_partner.upper()), ('order_number', 'like', order_number), ('state', '=', 'done')])
+            partner_vals.update({'name': partner_name})
+            partner_vals.update({"vat": rfc_partner.upper()})
+            partner_vals.update({'email': correo_electronico})
+            partner_vals.update({'l10n_mx_edi_fiscal_regime': regimen_fiscal})
+            partner_vals.update({'zip': cp_post})
+            partner_vals.update({'country_id': http.request.env['res.country'].search([('code', '=', 'MX')], limit=1).id})
+            partner_exist = partner_obj.create(partner_vals)
+        
+        # Revisar si ya existe una factura previa
+        request_preview = auto_invoice_obj.search([
+            ('rfc_partner', '=', rfc_partner.upper()), 
+            ('order_number', 'like', order_number), 
+            ('state', '=', 'done')
+        ])
         if request_preview:
             attachment_obj = http.request.env['website.self.invoice.web.attach'].sudo()
             attachments = attachment_obj.search([('website_auto_id', '=', request_preview[0].id)])
-            return http.request.render('website_self_cfdi_invoice_ee.html_result_thnks',
-                                       {
-                                           'attachments': attachments,
-                                       })
-        if not rfc_partner or not order_number: # or not mail_to:
-            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', {'errores': ['Los campos marcados con un ( * ) son Obligatorios.']})
+            return http.request.render('website_self_cfdi_invoice_ee.html_result_thnks', {
+                'attachments': attachments,
+            })
+        
+        # Crear la factura
         auto_invoice_id = auto_invoice_obj.create({
             'rfc_partner': rfc_partner.upper(),
             'order_number': order_number,
-            'monto_total': float(monto_total.replace(',','')),
+            'monto_total': monto_total_float,
             'l10n_mx_edi_usage': uso_del_cfdi,
             'l10n_mx_edi_payment_method_id': int(forma_de_pago_cfdi),
             'ticket_pos': ticket_pos,
             'partner_id': partner_exist.id,
         })
+        
         attachment_obj = http.request.env['website.self.invoice.web.attach'].sudo()
         attachments = attachment_obj.search([('website_auto_id', '=', auto_invoice_id.id)])
+        
         if auto_invoice_id.error_message:
-            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', {'errores': [auto_invoice_id.error_message]})
-        return http.request.render('website_self_cfdi_invoice_ee.html_result_thnks',
-                                   {
-                                       'attachments': attachments,
-                                   })
+            return http.request.render('website_self_cfdi_invoice_ee.html_result_error_inv', 
+                                    {'errores': [auto_invoice_id.error_message]})
+        
+        return http.request.render('website_self_cfdi_invoice_ee.html_result_thnks', {
+            'attachments': attachments,
+        })
 
     @http.route('/portal/consulta_factura/', type="http", auth="user", csrf=False, website=True)
     def request_invoice(self, **kwargs):
