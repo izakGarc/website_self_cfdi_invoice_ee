@@ -187,6 +187,7 @@ class website_self_invoice_web(models.Model):
                 if hasattr(invoice_br, 'factura_cfdi'):
                     vals.update({'factura_cfdi': True, })
                 vals.update({'l10n_mx_edi_usage': result.l10n_mx_edi_usage})
+                vals.update({'l10n_mx_edi_payment_policy': 'PUE'})
                 if invoice_br.partner_id.id != partner_id:
                     vals.update({'partner_id': partner_id})
                 if invoice_br.company_id != order_br.company_id:
@@ -291,6 +292,7 @@ class website_self_invoice_web(models.Model):
                 if hasattr(invoice_obj, 'factura_cfdi'):
                     vals.update({'factura_cfdi': True, })
                 vals.update({'l10n_mx_edi_usage': result.l10n_mx_edi_usage})
+                vals.update({'l10n_mx_edi_payment_policy': 'PUE'})
                 if invoice_br.partner_id.id != partner_id:
                     vals.update({'partner_id': partner_id})
                 if pos_br.payment_ids:
