@@ -148,6 +148,8 @@ class website_self_invoice_web(models.Model):
         if order_id and ticket_pos == False:
             order_obj = self.env['sale.order'].sudo()
             order_br = order_obj.browse(order_id)
+            # Forzar compañía correcta para todo el proceso EDI
+            self = self.with_company(order_br.company_id.id)
             result.order_number = order_br.name
 
             if order_br.state in ('draft', 'sent'):
@@ -175,13 +177,17 @@ class website_self_invoice_web(models.Model):
                            'state': 'error',
                         })
                         return result
+                    # Asignar forma de pago del portal al pedido antes de validar
+                    if result.l10n_mx_edi_payment_method_id and not order_br.l10n_mx_edi_payment_method_id:
+                        order_br.write({'l10n_mx_edi_payment_method_id': result.l10n_mx_edi_payment_method_id.id})
+
                     if not order_br.l10n_mx_edi_payment_method_id:
                         result.write({
                             'error_message': 'El pedido %s no pudo facturarse ya que no cuenta con una forma de pago asignada, comuniquese con la compañia.' % order_br.name,
                             'state': 'error',
                         })
                         return result
-                    invoice_return = order_br._create_invoices()
+                    invoice_return = order_br.with_company(order_br.company_id.id)._create_invoices()
                 invoice_br = self.env['account.move'].sudo().search([('id', '=', invoice_return.id)])
                 vals = {}
                 if hasattr(invoice_br, 'factura_cfdi'):
@@ -202,17 +208,62 @@ class website_self_invoice_web(models.Model):
                     vals.update({'l10n_mx_edi_payment_method_id': order_br.l10n_mx_edi_payment_method_id.id})
 
                 invoice_br.write(vals)
+                _logger.info('Partner PEDIDO: %s | ZIP: %s | VAT: %s',
+                    order_br.partner_id.name,
+                    order_br.partner_id.zip,
+                    order_br.partner_id.vat)
+                _logger.info('Partner FACTURA: %s | ZIP: %s | VAT: %s',
+                    invoice_br.partner_id.name,
+                    invoice_br.partner_id.zip,
+                    invoice_br.partner_id.vat)
                 if invoice_br.state == 'draft':
-                    invoice_br.sudo().action_post()
-                    invoice_br.sudo().action_process_edi_web_services()
+                    invoice_br.with_company(invoice_br.company_id.id).sudo().action_post()
+                    import time as time_module
+                    time_module.sleep(1)
+                    invoice_br.invalidate_recordset()
+                    edi_docs = invoice_br.edi_document_ids.filtered(lambda d: d.state in ('to_send', 'to_cancel'))
+                    if edi_docs:
+                        edi_docs.sudo().with_company(invoice_br.company_id.id)._process_documents_web_services(with_commit=False)
+                    time_module.sleep(3)
+                    invoice_br.invalidate_recordset()
+
                 if invoice_br.edi_state == 'to_send':
                     invoice_br.sudo().action_retry_edi_documents_error()
+                    for _ in range(10):
+                        invoice_br.invalidate_recordset()
+                        if invoice_br.edi_state in ('sent', 'to_cancel'):
+                            break
+                        if invoice_br.edi_document_ids.filtered(lambda d: d.error):
+                            break
+                        time_module.sleep(2)
 
                 if invoice_br.edi_state != 'sent':
-                    result.write({
-                        'error_message': 'El Pedido %s no se pudo timbrar correctamente, favor de contactar al departamento de facturación para asistirlo.' % result.order_number,
-                        'state': 'error',
-                    })
+                    edi_doc = invoice_br.edi_document_ids.filtered(lambda d: d.error)
+                    edi_error = edi_doc[0].error if edi_doc else ''
+                    
+                    # Rollback: cancelar y eliminar la factura
+                    try:
+                        if invoice_br.state == 'posted':
+                            invoice_br.sudo().button_cancel()
+                        if invoice_br.state in ('draft', 'cancel'):
+                            invoice_br.sudo().unlink()
+                        order_br.sudo().write({'invoice_status': 'to invoice'})
+                    except Exception as e:
+                        _logger.warning('No se pudo hacer rollback de factura: %s', str(e))
+                    
+                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi', 
+                                    'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
+                    is_user_error = any(kw in edi_error.lower() for kw in user_errors)
+                    msg = 'El Pedido %s no se pudo timbrar.' % result.order_number
+                    import re
+                    # Limpiar HTML del mensaje del PAC
+                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error).strip()
+                    edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
+                    if edi_error:
+                        msg += ' Detalle del SAT: %s' % edi_error_clean
+                    if not is_user_error:
+                        msg += ' Favor de contactar a soporte@loomber.com'
+                    result.write({'error_message': msg, 'state': 'error'})
                     return result
 
                 result.write({'attachment_ids': []})
@@ -228,6 +279,8 @@ class website_self_invoice_web(models.Model):
             invoice_obj = self.env['account.move'].sudo()
             pos_order_obj = self.env['pos.order'].sudo()
             pos_br = pos_order_obj.browse(order_id)
+            # Forzar compañía correcta para todo el proceso EDI
+            self = self.with_company(pos_br.company_id.id)
             pos_br.write({'partner_id': partner_id})
             if pos_br.partner_id:
                 if pos_br.partner_id.id != partner_id:
@@ -304,19 +357,55 @@ class website_self_invoice_web(models.Model):
                     payment_term_immediate = self.env.ref('account.account_payment_term_immediate', raise_if_not_found=False)
                     vals.update({'invoice_payment_term_id': payment_term_immediate.id})
                 invoice_br.write(vals)
+                
+                _logger.info('Partner PEDIDO: %s | ZIP: %s | VAT: %s',
+                    order_br.partner_id.name,
+                    order_br.partner_id.zip,
+                    order_br.partner_id.vat)
+                _logger.info('Partner FACTURA: %s | ZIP: %s | VAT: %s',
+                    invoice_br.partner_id.name,
+                    invoice_br.partner_id.zip,
+                    invoice_br.partner_id.vat)
                 if invoice_br.state == 'draft':
-                    invoice_br.sudo().action_post()
-                    invoice_br.sudo().action_process_edi_web_services()
-                if invoice_br.edi_state == 'to_send':
-                    invoice_br.sudo().action_retry_edi_documents_error()
+                    invoice_br.with_company(invoice_br.company_id.id).sudo().action_post()
+                    import time as time_module
+                    time_module.sleep(1)
+                    invoice_br.invalidate_recordset()
+                    edi_docs = invoice_br.edi_document_ids.filtered(lambda d: d.state in ('to_send', 'to_cancel'))
+                    if edi_docs:
+                        edi_docs.sudo().with_company(invoice_br.company_id.id)._process_documents_web_services(with_commit=False)
+                    time_module.sleep(3)
+                    invoice_br.invalidate_recordset()
                 #_logger.info('uuid %s partner %s nombre %s uso_cfdi %s', invoice_br.l10n_mx_edi_cfdi_uuid,
                 #             invoice_br.partner_id.name, invoice_br.name, invoice_br.l10n_mx_edi_usage)
 
                 if invoice_br.edi_state != 'sent':
-                    result.write({
-                        'error_message': 'El ticket %s no se pudo timbrar correctamente, favor de contactar al departamento de facturación para asistirlo.' % result.order_number,
-                        'state': 'error',
-                    })
+                    edi_doc = invoice_br.edi_document_ids.filtered(lambda d: d.error)
+                    edi_error = edi_doc[0].error if edi_doc else ''
+                    
+                    # Rollback: cancelar y eliminar la factura
+                    try:
+                        if invoice_br.state == 'posted':
+                            invoice_br.sudo().button_cancel()
+                        if invoice_br.state in ('draft', 'cancel'):
+                            invoice_br.sudo().unlink()
+                        pos_br.sudo().write({'state': 'done', 'account_move': False})
+                    except Exception as e:
+                        _logger.warning('No se pudo hacer rollback de factura POS: %s', str(e))
+                    
+                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi', 
+                                    'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
+                    is_user_error = any(kw in edi_error.lower() for kw in user_errors)
+                    msg = 'El ticket %s no se pudo timbrar.' % result.order_number
+                    import re
+                    # Limpiar HTML del mensaje del PAC
+                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error).strip()
+                    edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
+                    if edi_error:
+                        msg += ' Detalle del SAT: %s' % edi_error_clean
+                    if not is_user_error:
+                        msg += ' Favor de contactar a soporte@loomber.com'
+                    result.write({'error_message': msg, 'state': 'error'})
                     return result
 
                 result.write({'attachment_ids': []})
