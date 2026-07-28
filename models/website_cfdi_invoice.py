@@ -164,7 +164,7 @@ class website_self_invoice_web(models.Model):
                 invoice_return = None
                 if order_br.invoice_status == 'invoiced':
                     invoice_return = order_br.invoice_ids.filtered(lambda r: r.state != 'cancel')
-                    if invoice_return and invoice_return[0].edi_state == 'sent':
+                    if invoice_return and invoice_return[0].l10n_mx_edi_cfdi_state == 'sent':
                         result.write({
                             'error_message': 'El Pedido %s ya fue Facturado.' % result.order_number,
                             'state': 'error',
@@ -218,29 +218,17 @@ class website_self_invoice_web(models.Model):
                     invoice_br.partner_id.vat)
                 if invoice_br.state == 'draft':
                     invoice_br.with_company(invoice_br.company_id.id).sudo().action_post()
-                    import time as time_module
-                    time_module.sleep(1)
-                    invoice_br.invalidate_recordset()
-                    edi_docs = invoice_br.edi_document_ids.filtered(lambda d: d.state in ('to_send', 'to_cancel'))
-                    if edi_docs:
-                        edi_docs.sudo().with_company(invoice_br.company_id.id)._process_documents_web_services(with_commit=False)
-                    time_module.sleep(3)
-                    invoice_br.invalidate_recordset()
 
-                if invoice_br.edi_state == 'to_send':
-                    invoice_br.sudo().action_retry_edi_documents_error()
-                    for _ in range(10):
-                        invoice_br.invalidate_recordset()
-                        if invoice_br.edi_state in ('sent', 'to_cancel'):
-                            break
-                        if invoice_br.edi_document_ids.filtered(lambda d: d.error):
-                            break
-                        time_module.sleep(2)
+                # Timbrar con API de Odoo 19 (síncrono)
+                invoice_br.sudo().with_company(invoice_br.company_id.id)._l10n_mx_edi_cfdi_invoice_try_send()
+                invoice_br.invalidate_recordset()
 
-                if invoice_br.edi_state != 'sent':
-                    edi_doc = invoice_br.edi_document_ids.filtered(lambda d: d.error)
-                    edi_error = edi_doc[0].error if edi_doc else ''
-                    
+                if invoice_br.l10n_mx_edi_cfdi_state != 'sent':
+                    failed_doc = invoice_br.l10n_mx_edi_document_ids.filtered(
+                        lambda d: d.state == 'invoice_sent_failed'
+                    )
+                    edi_error = failed_doc[0].message if failed_doc else ''
+
                     # Rollback: cancelar y eliminar la factura
                     try:
                         if invoice_br.state == 'posted':
@@ -250,16 +238,15 @@ class website_self_invoice_web(models.Model):
                         order_br.sudo().write({'invoice_status': 'to invoice'})
                     except Exception as e:
                         _logger.warning('No se pudo hacer rollback de factura: %s', str(e))
-                    
-                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi', 
-                                    'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
-                    is_user_error = any(kw in edi_error.lower() for kw in user_errors)
-                    msg = 'El Pedido %s no se pudo timbrar.' % result.order_number
+
                     import re
-                    # Limpiar HTML del mensaje del PAC
-                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error).strip()
+                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi',
+                                   'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
+                    is_user_error = any(kw in (edi_error or '').lower() for kw in user_errors)
+                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error or '').strip()
                     edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
-                    if edi_error:
+                    msg = 'El Pedido %s no se pudo timbrar.' % result.order_number
+                    if edi_error_clean:
                         msg += ' Detalle del SAT: %s' % edi_error_clean
                     if not is_user_error:
                         msg += ' Favor de contactar a soporte@loomber.com'
@@ -307,7 +294,7 @@ class website_self_invoice_web(models.Model):
                    invoice_br = invoice_obj.search([('invoice_origin', '=', pos_br.name), ('state', '!=', 'cancel')], limit=1)
                    tryagain = True
 
-                   if invoice_br and invoice_br[0].edi_state == 'sent':
+                   if invoice_br and invoice_br[0].l10n_mx_edi_cfdi_state == 'sent':
                        result.write({
                            'error_message': 'El Pedido %s ya fue Facturado.' % result.order_number,
                            'state': 'error',
@@ -368,22 +355,18 @@ class website_self_invoice_web(models.Model):
                     invoice_br.partner_id.vat)
                 if invoice_br.state == 'draft':
                     invoice_br.with_company(invoice_br.company_id.id).sudo().action_post()
-                    import time as time_module
-                    time_module.sleep(1)
-                    invoice_br.invalidate_recordset()
-                    edi_docs = invoice_br.edi_document_ids.filtered(lambda d: d.state in ('to_send', 'to_cancel'))
-                    if edi_docs:
-                        edi_docs.sudo().with_company(invoice_br.company_id.id)._process_documents_web_services(with_commit=False)
-                    time_module.sleep(3)
-                    invoice_br.invalidate_recordset()
-                #_logger.info('uuid %s partner %s nombre %s uso_cfdi %s', invoice_br.l10n_mx_edi_cfdi_uuid,
-                #             invoice_br.partner_id.name, invoice_br.name, invoice_br.l10n_mx_edi_usage)
 
-                if invoice_br.edi_state != 'sent':
-                    edi_doc = invoice_br.edi_document_ids.filtered(lambda d: d.error)
-                    edi_error = edi_doc[0].error if edi_doc else ''
-                    
-                    # Rollback: cancelar y eliminar la factura
+                # Timbrar con API de Odoo 19 (síncrono)
+                invoice_br.sudo().with_company(invoice_br.company_id.id)._l10n_mx_edi_cfdi_invoice_try_send()
+                invoice_br.invalidate_recordset()
+
+                if invoice_br.l10n_mx_edi_cfdi_state != 'sent':
+                    failed_doc = invoice_br.l10n_mx_edi_document_ids.filtered(
+                        lambda d: d.state == 'invoice_sent_failed'
+                    )
+                    edi_error = failed_doc[0].message if failed_doc else ''
+
+                    # Rollback: cancelar y eliminar la factura POS
                     try:
                         if invoice_br.state == 'posted':
                             invoice_br.sudo().button_cancel()
@@ -392,16 +375,15 @@ class website_self_invoice_web(models.Model):
                         pos_br.sudo().write({'state': 'done', 'account_move': False})
                     except Exception as e:
                         _logger.warning('No se pudo hacer rollback de factura POS: %s', str(e))
-                    
-                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi', 
-                                    'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
-                    is_user_error = any(kw in edi_error.lower() for kw in user_errors)
-                    msg = 'El ticket %s no se pudo timbrar.' % result.order_number
+
                     import re
-                    # Limpiar HTML del mensaje del PAC
-                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error).strip()
+                    user_errors = ['rfc', 'código postal', 'cp', 'regimen', 'régimen', 'uso', 'cfdi',
+                                   'receptor', 'domicilio', 'fiscal', 'lugarexpedicion', 'domiciliofiscal']
+                    is_user_error = any(kw in (edi_error or '').lower() for kw in user_errors)
+                    edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error or '').strip()
                     edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
-                    if edi_error:
+                    msg = 'El ticket %s no se pudo timbrar.' % result.order_number
+                    if edi_error_clean:
                         msg += ' Detalle del SAT: %s' % edi_error_clean
                     if not is_user_error:
                         msg += ' Favor de contactar a soporte@loomber.com'

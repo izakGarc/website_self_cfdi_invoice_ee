@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
 import re
-import time
 
 from odoo import http
 from odoo.http import request
@@ -43,8 +42,8 @@ class CfdiPortalController(http.Controller):
             return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
                                   {'errores': ['No se encontró el pedido %s o aún no ha sido confirmado.' % order_number]})
 
-        # Verificar si ya existe factura timbrada
-        if order.invoice_ids.filtered(lambda inv: inv.state == 'posted' and inv.edi_state == 'sent'):
+        # En Odoo 19: l10n_mx_edi_cfdi_state reemplaza a edi_state
+        if order.invoice_ids.filtered(lambda inv: inv.state == 'posted' and inv.l10n_mx_edi_cfdi_state == 'sent'):
             return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
                                   {'errores': ['El pedido %s ya fue facturado.' % order_number]})
 
@@ -129,21 +128,26 @@ class CfdiPortalController(http.Controller):
             return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
                                   {'errores': ['Pedido %s no encontrado.' % order_number]})
 
-        if order.invoice_ids.filtered(lambda inv: inv.state == 'posted' and inv.edi_state == 'sent'):
+        if order.invoice_ids.filtered(lambda inv: inv.state == 'posted' and inv.l10n_mx_edi_cfdi_state == 'sent'):
             return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
                                   {'errores': ['El pedido %s ya fue facturado.' % order_number]})
 
         company = order.company_id
 
         # — Buscar o crear partner —
+        mexico = env['res.country'].sudo().search([('code', '=', 'MX')], limit=1)
         partner = env['res.partner'].sudo().search([('vat', '=', rfc)], limit=1)
         if partner:
-            write_vals = {'name': partner_name, 'zip': cp, 'l10n_mx_edi_fiscal_regime': regimen}
+            write_vals = {
+                'name': partner_name,
+                'zip': cp,
+                'l10n_mx_edi_fiscal_regime': regimen,
+                'country_id': mexico.id,  # requerido por _check_move_constraints de CFDI 4.0
+            }
             if correo and correo not in (partner.email or ''):
                 write_vals['email'] = correo
             partner.sudo().write(write_vals)
         else:
-            mexico = env['res.country'].sudo().search([('code', '=', 'MX')], limit=1)
             partner = env['res.partner'].sudo().create({
                 'name': partner_name,
                 'vat': rfc,
@@ -176,7 +180,7 @@ class CfdiPortalController(http.Controller):
             vals['factura_cfdi'] = True
         invoice.sudo().write(vals)
 
-        # — Validar factura (action_post) con compañía correcta —
+        # — Validar factura —
         if invoice.state == 'draft':
             try:
                 invoice.sudo().with_company(company.id).action_post()
@@ -186,33 +190,36 @@ class CfdiPortalController(http.Controller):
                 return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
                                       {'errores': ['Error al validar la factura. Contacte a soporte@loomber.com']})
 
-        # — Timbrar EDI con compañía correcta —
+        # — Timbrar usando la API oficial de Odoo 19 —
+        # _generate_and_send_invoices valida partner.country_id + partner.zip antes de
+        # contactar al PAC (_check_move_constraints), evitando rechazos silenciosos de CFDI 4.0.
         try:
-            edi_docs = invoice.edi_document_ids.filtered(lambda d: d.state in ('to_send', 'to_cancel'))
-            if edi_docs:
-                edi_docs.sudo().with_company(company.id)._process_documents_web_services(with_commit=False)
+            self.env['account.move.send'].sudo()._generate_and_send_invoices(
+                invoice.sudo().with_company(company.id),
+                sending_methods=['manual'],
+                extra_edis={'mx_cfdi'},
+            )
         except Exception as e:
             _logger.error('Error EDI para %s: %s', invoice.name, str(e))
-
-        # — Esperar resultado (máx 30 seg) —
-        for _ in range(15):
-            invoice.invalidate_recordset()
-            if invoice.edi_state == 'sent':
-                break
-            if invoice.edi_document_ids.filtered(lambda d: d.error):
-                break
-            time.sleep(2)
-
-        # — Verificar resultado final —
-        invoice.invalidate_recordset()
-        if invoice.edi_state != 'sent':
-            edi_doc_error = invoice.edi_document_ids.filtered(lambda d: d.error)
-            edi_error_raw = edi_doc_error[0].error if edi_doc_error else ''
-            edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error_raw).strip()
-            edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
-            _logger.warning('Timbrado fallido para %s: %s', order_number, edi_error_clean)
             self._rollback_invoice(invoice, order)
-            return render_form(self._traducir_error_sat(edi_error_clean))
+            return request.render('website_self_cfdi_invoice_ee.html_result_error_inv',
+                                  {'errores': [str(e)]})
+
+        # — Verificar resultado —
+        invoice.invalidate_recordset()
+        if invoice.l10n_mx_edi_cfdi_state != 'sent':
+            failed_doc = invoice.l10n_mx_edi_document_ids.filtered(
+                lambda d: d.state == 'invoice_sent_failed'
+            )
+            edi_error_raw = failed_doc[0].message if failed_doc else ''
+            edi_error_clean = re.sub(r'<[^>]+>', ' ', edi_error_raw or '').strip()
+            edi_error_clean = re.sub(r'\s+', ' ', edi_error_clean)
+            _logger.warning('Timbrado fallido para %s | Error SAT: %s', order_number, edi_error_clean)
+            self._rollback_invoice(invoice, order)
+            friendly = self._traducir_error_sat(edi_error_clean)
+            if edi_error_clean:
+                friendly += '\n\nDetalle del SAT: ' + edi_error_clean
+            return render_form(friendly)
 
         # — Enviar correo con la factura —
         try:
@@ -231,67 +238,39 @@ class CfdiPortalController(http.Controller):
 
         e = error_raw.lower()
 
-        # RFC
         if 'rfc' in e and ('invalido' in e or 'inválido' in e or 'invalid' in e or 'no existe' in e):
             return 'El RFC ingresado no es válido o no está registrado en el SAT.'
         if 'rfc' in e and 'receptor' in e:
             return 'El RFC del receptor no es válido. Verifica que esté escrito correctamente.'
         if 'rfc' in e and 'emisor' in e:
             return 'Error en el RFC del emisor. Contacta a soporte@loomber.com'
-
-        # Nombre / Razón Social
         if 'nombre' in e and ('receptor' in e or 'denominacion' in e or 'denominación' in e):
             return 'El Nombre o Razón Social no coincide con el RFC registrado en el SAT.'
         if 'denominacion' in e or 'denominación' in e:
             return 'El Nombre o Razón Social no coincide con el RFC registrado en el SAT.'
-
-        # Régimen Fiscal
         if 'regimen' in e or 'régimen' in e:
             return 'El Régimen Fiscal no es compatible con tu RFC. Verifica que sea el correcto.'
-        if 'regimenf' in e or 'regimenfiscal' in e:
-            return 'El Régimen Fiscal seleccionado no corresponde al tipo de contribuyente.'
-
-        # Uso CFDI
         if 'uso' in e and 'cfdi' in e:
             return 'El Uso del CFDI no es compatible con tu Régimen Fiscal.'
-        if 'usocfdi' in e:
-            return 'El Uso del CFDI no es compatible con tu Régimen Fiscal.'
-
-        # Código Postal
         if 'codigo postal' in e or 'código postal' in e or 'codigopostal' in e or 'domicilio fiscal' in e:
             return 'El Código Postal no existe en el catálogo del SAT o no corresponde a tu RFC.'
-
-        # Certificado / Sello
         if 'sello' in e or 'certificado' in e or 'certificate' in e:
             return 'Error en el certificado digital. Contacta a soporte@loomber.com'
-
-        # Fecha
         if 'fecha' in e:
             return 'Error en la fecha de emisión. Contacta a soporte@loomber.com'
-
-        # Impuestos
         if 'impuesto' in e or 'tax' in e or 'iva' in e:
             return 'Error en el cálculo de impuestos. Contacta a soporte@loomber.com'
-
-        # Producto / UNSPSC
         if 'clave' in e and ('prod' in e or 'serv' in e):
             return 'Error en la clave de producto. Contacta a soporte@loomber.com'
         if 'unspsc' in e or 'claveprodserv' in e:
             return 'El producto no tiene una clave UNSPSC asignada. Contacta a soporte@loomber.com'
-
-        # XML mal formado genérico
         if 'xml' in e or 'mal formado' in e or 'malformado' in e or '301' in e:
             return 'Los datos ingresados contienen un error de formato. Verifica tu RFC, Nombre y Código Postal.'
-
-        # Error de conexión con el PAC
         if 'timeout' in e or 'connection' in e or 'conexion' in e or 'conexión' in e:
             return 'El servicio de timbrado no está disponible en este momento. Intenta en unos minutos.'
-
-        # Duplicado
         if 'duplicado' in e or 'duplicate' in e or 'ya fue timbrado' in e:
             return 'Esta factura ya fue timbrada anteriormente.'
 
-        # Genérico
         return 'No se pudo timbrar la factura. Verifica tus datos fiscales o contacta a soporte@loomber.com'
 
     # ─────────────────────────────────────────────────────────────
