@@ -31,7 +31,12 @@ class CfdiPortalController(http.Controller):
                                   {'errores': ['El folio del pedido es obligatorio.']})
 
         order = request.env['sale.order'].sudo().search(
-            [('name', '=', order_number), ('state', 'in', ('sale', 'done'))], limit=1
+            ['&',
+            '|',
+            ('name', '=', order_number),
+            ('client_order_ref', '=', order_number),
+            ('state', 'in', ('sale', 'done'))],
+            limit=1
         )
 
         if not order:
